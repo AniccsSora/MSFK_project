@@ -3,7 +3,7 @@ import serial.tools.list_ports
 import struct
 import time
 from typing import Optional, List, Tuple
-from module.com_port_detector import PortDetector
+from module.com_port_detector import PortDetector as pd
 
 class ArduinoHIDException(Exception):
     """Arduino HID 異常"""
@@ -17,6 +17,7 @@ class ArduinoHID:
     ACK_CRC_ERROR = 0xF1
     ACK_INVALID_CMD = 0xF2
     ACK_PARAM_ERROR = 0xF3
+    ACK_INTERRUPTED = 0xF4  # 新增:被中斷
 
     # Command
     CMD_MOUSE_MOVE = 0x01
@@ -30,6 +31,9 @@ class ArduinoHID:
     CMD_KB_RELEASE_ALL = 0x13
     CMD_KB_PRINT = 0x14
     CMD_KB_PRESS_TIMED = 0x15
+    CMD_PAUSE_LOG = 0x20  # 新增:暫停日誌
+    CMD_RESUME_LOG = 0x21  # 新增:恢復日誌
+    CMD_CLEAR_QUEUE = 0x22  # 新增:清空佇列
 
     # Mouse
     MOUSE_LEFT = 0x01
@@ -37,7 +41,7 @@ class ArduinoHID:
     MOUSE_MIDDLE = 0x04
     MOUSE_ALL = 0x07
 
-    # Keyboard
+    # Keyboard (只列出常用的)
     KEY_LEFT_CTRL = 0x80
     KEY_LEFT_SHIFT = 0x81
     KEY_LEFT_ALT = 0x82
@@ -110,29 +114,30 @@ class ArduinoHID:
         0xB6, 0xE8, 0x0A, 0x54, 0xD7, 0x89, 0x6B, 0x35
     ]
 
-    def __init__(self, port: Optional[str] = None, baudrate: int = 230400,
-                 timeout: float = 0.1, retries: int = 3, auto_detect: bool = True):
+    def __init__(self, port: Optional[str] = None, baudrate: int = 115200,
+                 timeout: float = 0.1, retries: int = 3, debug=False, auto_detect: bool = True):
         """
-        Init Arduino HID
+        初始化 Arduino HID (改良版)
 
         Args:
-            port: `COMx` string, if None go auto-detect
-            baudrate: bardrate (default: 230400)
-            timeout: timeout
-            retries: retry
-            auto_detect: True.
+            port: COM port (None 則自動偵測)
+            baudrate: 傳輸速率
+            timeout: 逾時時間
+            retries: 重試次數
+            auto_detect: 是否自動偵測
         """
-        if port is None and auto_detect:
-            print("🔍 正在自動偵測 Arduino 裝置...")
-            port = PortDetector.find_arduino()
+        self.interrupted = False  # 中斷旗標
 
-            if port is None:
-                print("\n❌ 自動偵測失敗,顯示所有可用 COM Port:")
-                PortDetector.print_all_ports()
-                raise ArduinoHIDException("找不到 Arduino 裝置,請手動指定 port 參數")
+        port = pd.find_arduino()
 
         if port is None:
-            raise ArduinoHIDException("必須指定 port 參數或啟用 auto_detect")
+            # 這裡可以加入你的 PortDetector
+            available_ports = list(serial.tools.list_ports.comports())
+            if available_ports:
+                port = available_ports[0].device
+                print(f"🔍 自動選擇: {port}")
+            else:
+                raise ArduinoHIDException("找不到可用的 COM Port")
 
         try:
             self.ser = serial.Serial(port, baudrate, timeout=timeout)
@@ -176,6 +181,9 @@ class ArduinoHID:
 
                 if ack_code == self.ACK_SUCCESS:
                     return True
+                elif ack_code == self.ACK_INTERRUPTED:
+                    self.interrupted = True
+                    raise ArduinoHIDException("⚠️ 指令被硬體按鈕中斷!")
                 elif ack_code == self.ACK_CRC_ERROR:
                     if attempt < self.retries - 1:
                         time.sleep(0.01)
@@ -192,6 +200,28 @@ class ArduinoHID:
                 raise ArduinoHIDException(f"Serial error: {e}")
 
         return False
+
+    # ========== 新增的控制方法 ==========
+
+    def pause_logging(self) -> bool:
+        """暫停 Arduino 端的日誌輸出"""
+        return self._send_packet(self.CMD_PAUSE_LOG)
+
+    def resume_logging(self) -> bool:
+        """恢復 Arduino 端的日誌輸出"""
+        return self._send_packet(self.CMD_RESUME_LOG)
+
+    def clear_queue(self) -> bool:
+        """清空 Arduino 端的指令佇列"""
+        return self._send_packet(self.CMD_CLEAR_QUEUE)
+
+    def reset_interrupt_flag(self):
+        """重置中斷旗標"""
+        self.interrupted = False
+
+    def check_interrupted(self) -> bool:
+        """檢查是否被中斷"""
+        return self.interrupted
 
     # ========== 滑鼠方法 ==========
 
@@ -215,20 +245,14 @@ class ArduinoHID:
         """點擊滑鼠"""
         return self._send_packet(self.CMD_MOUSE_CLICK, bytes([button]))
 
-    def mouse_press_for(self, button: int = MOUSE_LEFT, duration: float = 0.2) -> bool:
-        """按住滑鼠按鍵指定時間後釋放"""
-        if not self.mouse_press(button):
-            return False
-        time.sleep(duration)
-        return self.mouse_release(button)
-
     def mouse_press_timed(self, button: int = MOUSE_LEFT, duration_ms: int = 200) -> bool:
-        """按住滑鼠按鍵指定時間後釋放(Arduino 端控制)"""
+        """按住滑鼠按鍵指定時間後釋放(Arduino 端控制,非阻塞)"""
         duration_ms = max(1, min(65535, duration_ms))
         params = struct.pack('>BH', button, duration_ms)
         return self._send_packet(self.CMD_MOUSE_PRESS_TIMED, params)
 
     # ========== 鍵盤方法 ==========
+
     def keyboard_press(self, key: int) -> bool:
         """按下按鍵"""
         return self._send_packet(self.CMD_KB_PRESS, bytes([key]))
@@ -237,37 +261,61 @@ class ArduinoHID:
         """釋放按鍵"""
         return self._send_packet(self.CMD_KB_RELEASE, bytes([key]))
 
-    def keyboard_write(self, key: int) -> bool:
+    def keyboard_send(self, key: int, delay=0.05) -> bool:
         """按下並釋放按鍵"""
+        time.sleep(delay)
         return self._send_packet(self.CMD_KB_WRITE, bytes([key]))
 
     def keyboard_release_all(self) -> bool:
         """釋放所有按鍵"""
         return self._send_packet(self.CMD_KB_RELEASE_ALL)
 
-    def keyboard_press_for(self, key: int, duration: float) -> bool:
-        """按住按鍵指定時間後釋放"""
-        if not self.keyboard_press(key):
-            return False
-        time.sleep(duration)
-        return self.keyboard_release(key)
-
     def keyboard_press_timed(self, key: int, duration_ms: int) -> bool:
-        """按住按鍵指定時間後釋放(Arduino 端控制)"""
+        """按住按鍵指定時間後釋放(Arduino 端控制,非阻塞)"""
         duration_ms = max(1, min(65535, duration_ms))
         params = struct.pack('>BH', key, duration_ms)
         return self._send_packet(self.CMD_KB_PRESS_TIMED, params)
 
-    def keyboard_print(self, text: str) -> bool:
-        """輸入字串(一次性發送)"""
+    def keyboard_print(self, text: str, check_interrupt: bool = True) -> bool:
+        """
+        輸入字串(一次性發送)
+
+        Args:
+            text: 要輸入的文字
+            check_interrupt: 是否在每個 chunk 後檢查中斷旗標
+        """
         if len(text) > 30:
             for i in range(0, len(text), 30):
+                if check_interrupt and self.interrupted:
+                    print("⚠️ 文字輸入被中斷")
+                    return False
+
                 chunk = text[i:i + 30]
                 if not self._send_packet(self.CMD_KB_PRINT, chunk.encode('ascii', errors='ignore')):
                     return False
             return True
         else:
             return self._send_packet(self.CMD_KB_PRINT, text.encode('ascii', errors='ignore'))
+
+    def keyboard_type_str(self, text: str, delay: float = 0.01, check_interrupt: bool = True) -> bool:
+        """
+        輸入文字(逐字元發送)
+
+        Args:
+            text: 要輸入的文字
+            delay: 字元間延遲
+            check_interrupt: 是否檢查中斷旗標
+        """
+        for char in text:
+            if check_interrupt and self.interrupted:
+                print("⚠️ 打字被中斷")
+                return False
+
+            if not self.keyboard_send(ord(char)):
+                return False
+            if delay > 0:
+                time.sleep(delay)
+        return True
 
     def keyboard_execute_sequence(self, *actions, delay: float = 0.01) -> bool:
         """
@@ -288,11 +336,11 @@ class ArduinoHID:
         for action in actions:
             if isinstance(action, str):
                 # 字串：輸入文字
-                if not self.keyboard_type(action, delay=delay):
+                if not self.keyboard_type_str(action, delay=delay):
                     return False
             elif isinstance(action, int):
                 # 整數：按鍵代碼
-                if not self.keyboard_write(action):
+                if not self.keyboard_send(action):
                     return False
                 time.sleep(delay)
             elif isinstance(action, list):
@@ -300,7 +348,7 @@ class ArduinoHID:
                 for key in action:
                     if not isinstance(key, int):
                         raise ValueError(f"列表中的元素必須是整數按鍵代碼: {key}")
-                    if not self.keyboard_write(key):
+                    if not self.keyboard_send(key):
                         return False
                     time.sleep(delay)
             else:
@@ -308,14 +356,6 @@ class ArduinoHID:
 
         return True
 
-    def keyboard_type(self, text: str, delay: float = 0.01) -> bool:
-        """輸入文字(逐字元發送)"""
-        for char in text:
-            if not self.keyboard_write(ord(char)):
-                return False
-            if delay > 0:
-                time.sleep(delay)
-        return True
 
     def hotkey(self, *keys: int, hold_time: float = 0.05) -> bool:
         """執行快捷鍵組合"""
@@ -329,40 +369,24 @@ class ArduinoHID:
         return True
 
     # ========== 常用快捷鍵 ==========
+
     def backspace(self) -> bool:
-        """ Backspace """
-        return self.keyboard_write(self.KEY_BACKSPACE)
+        return self.keyboard_send(self.KEY_BACKSPACE)
 
     def enter(self) -> bool:
-        """ Enter """
-        return self.keyboard_write(self.KEY_RETURN)
+        return self.keyboard_send(self.KEY_RETURN)
+
     def alt_f4(self) -> bool:
-        """ Alt+F4 """
         return self.hotkey(self.KEY_LEFT_ALT, self.KEY_F4)
 
     def win_r(self) -> bool:
-        """ Win+R """
         return self.hotkey(self.KEY_LEFT_GUI, ord('r'))
 
     def ctrl_c(self) -> bool:
-        """Ctrl+C"""
         return self.hotkey(self.KEY_LEFT_CTRL, ord('c'))
 
     def ctrl_v(self) -> bool:
-        """Ctrl+V"""
         return self.hotkey(self.KEY_LEFT_CTRL, ord('v'))
-
-    def ctrl_x(self) -> bool:
-        """Ctrl+X"""
-        return self.hotkey(self.KEY_LEFT_CTRL, ord('x'))
-
-    def ctrl_z(self) -> bool:
-        """Ctrl+Z"""
-        return self.hotkey(self.KEY_LEFT_CTRL, ord('z'))
-
-    def ctrl_a(self) -> bool:
-        """Ctrl+A"""
-        return self.hotkey(self.KEY_LEFT_CTRL, ord('a'))
 
     def close(self):
         """關閉連接"""
@@ -376,27 +400,23 @@ class ArduinoHID:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-if __name__ == "__main__":
 
+# ========== 使用範例 ==========
+if __name__ == "__main__":
     with ArduinoHID() as presser:
+        print("1. 打開記事本...")
         presser.win_r()
         time.sleep(1)
         presser.keyboard_print("notepad")
-        time.sleep(1)
+        time.sleep(0.5)
         presser.enter()
         time.sleep(1)
-        #
-        presser.keyboard_execute_sequence(">>>", "<<<", [presser.KEY_LEFT_ARROW]*3, delay=0.25 )
+
+        # presser.keyboard_execute_sequence(">>>","<<<", [presser.KEY_LEFT_ARROW]*3, delay=0.1)
 
         with open("../asset/test_text_sample/123.txt", "r", encoding="utf-8") as f:
             content = f.read()
             for c in content:
-                presser.keyboard_type(c, delay=0.035)
-                presser.backspace()
-
-        presser.alt_f4()
-        presser.keyboard_execute_sequence(presser.KEY_LEFT_ARROW,
-                                          presser.KEY_RETURN, delay=0.5)
+                presser.keyboard_type_str(c, delay=0.0)
 
 
-        print("done")
