@@ -3,7 +3,7 @@ import serial.tools.list_ports
 import struct
 import time
 from typing import Optional, List, Tuple
-from module.portDetector import PortDetector
+from module.com_port_detector import PortDetector
 
 class ArduinoHIDException(Exception):
     """Arduino HID 異常"""
@@ -11,14 +11,14 @@ class ArduinoHIDException(Exception):
 
 
 class ArduinoHID:
-    # 協議定義
+    # Protocol
     SYNC_BYTE = 0xAA
     ACK_SUCCESS = 0xF0
     ACK_CRC_ERROR = 0xF1
     ACK_INVALID_CMD = 0xF2
     ACK_PARAM_ERROR = 0xF3
 
-    # 指令定義
+    # Command
     CMD_MOUSE_MOVE = 0x01
     CMD_MOUSE_PRESS = 0x02
     CMD_MOUSE_RELEASE = 0x03
@@ -31,13 +31,13 @@ class ArduinoHID:
     CMD_KB_PRINT = 0x14
     CMD_KB_PRESS_TIMED = 0x15
 
-    # 滑鼠按鍵
+    # Mouse
     MOUSE_LEFT = 0x01
     MOUSE_RIGHT = 0x02
     MOUSE_MIDDLE = 0x04
     MOUSE_ALL = 0x07
 
-    # 鍵盤按鍵常數
+    # Keyboard
     KEY_LEFT_CTRL = 0x80
     KEY_LEFT_SHIFT = 0x81
     KEY_LEFT_ALT = 0x82
@@ -74,7 +74,7 @@ class ArduinoHID:
     KEY_F11 = 0xCC
     KEY_F12 = 0xCD
 
-    # CRC-8/MAXIM 查找表
+    # CRC-8/MAXIM lookup table
     CRC8_TABLE = [
         0x00, 0x5E, 0xBC, 0xE2, 0x61, 0x3F, 0xDD, 0x83,
         0xC2, 0x9C, 0x7E, 0x20, 0xA3, 0xFD, 0x1F, 0x41,
@@ -113,14 +113,14 @@ class ArduinoHID:
     def __init__(self, port: Optional[str] = None, baudrate: int = 230400,
                  timeout: float = 0.1, retries: int = 3, auto_detect: bool = True):
         """
-        初始化 Arduino HID
+        Init Arduino HID
 
         Args:
-            port: 串列埠名稱,如果為 None 則自動偵測
-            baudrate: 鮑率 (預設 230400)
-            timeout: 讀取超時 (秒)
-            retries: 失敗重試次數
-            auto_detect: 當 port 為 None 時是否自動偵測
+            port: `COMx` string, if None go auto-detect
+            baudrate: bardrate (default: 230400)
+            timeout: timeout
+            retries: retry
+            auto_detect: True.
         """
         if port is None and auto_detect:
             print("🔍 正在自動偵測 Arduino 裝置...")
@@ -229,7 +229,6 @@ class ArduinoHID:
         return self._send_packet(self.CMD_MOUSE_PRESS_TIMED, params)
 
     # ========== 鍵盤方法 ==========
-
     def keyboard_press(self, key: int) -> bool:
         """按下按鍵"""
         return self._send_packet(self.CMD_KB_PRESS, bytes([key]))
@@ -270,6 +269,45 @@ class ArduinoHID:
         else:
             return self._send_packet(self.CMD_KB_PRINT, text.encode('ascii', errors='ignore'))
 
+    def keyboard_execute_sequence(self, *actions, delay: float = 0.01) -> bool:
+        """
+        執行複雜的鍵盤操作序列
+
+        Args:
+            *actions: 動作序列，可以是字串（輸入文字）或整數（按鍵代碼）
+            delay: 延遲時間
+
+        Example:
+            # 輸入 ">>>" 然後輸入 "<<<" 再向左移動3次
+            keyboard_execute_sequence(">>>", "<<<",
+                                     KEY_LEFT_ARROW, KEY_LEFT_ARROW, KEY_LEFT_ARROW,
+                                     [KEY_LEFT_ARROW]*3 )
+        Returns:
+            bool: 執行是否成功
+        """
+        for action in actions:
+            if isinstance(action, str):
+                # 字串：輸入文字
+                if not self.keyboard_type(action, delay=delay):
+                    return False
+            elif isinstance(action, int):
+                # 整數：按鍵代碼
+                if not self.keyboard_write(action):
+                    return False
+                time.sleep(delay)
+            elif isinstance(action, list):
+                # 列表：多個按鍵代碼
+                for key in action:
+                    if not isinstance(key, int):
+                        raise ValueError(f"列表中的元素必須是整數按鍵代碼: {key}")
+                    if not self.keyboard_write(key):
+                        return False
+                    time.sleep(delay)
+            else:
+                raise ValueError(f"不支援的動作類型: {type(action)}")
+
+        return True
+
     def keyboard_type(self, text: str, delay: float = 0.01) -> bool:
         """輸入文字(逐字元發送)"""
         for char in text:
@@ -291,6 +329,20 @@ class ArduinoHID:
         return True
 
     # ========== 常用快捷鍵 ==========
+    def backspace(self) -> bool:
+        """ Backspace """
+        return self.keyboard_write(self.KEY_BACKSPACE)
+
+    def enter(self) -> bool:
+        """ Enter """
+        return self.keyboard_write(self.KEY_RETURN)
+    def alt_f4(self) -> bool:
+        """ Alt+F4 """
+        return self.hotkey(self.KEY_LEFT_ALT, self.KEY_F4)
+
+    def win_r(self) -> bool:
+        """ Win+R """
+        return self.hotkey(self.KEY_LEFT_GUI, ord('r'))
 
     def ctrl_c(self) -> bool:
         """Ctrl+C"""
@@ -323,3 +375,28 @@ class ArduinoHID:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+if __name__ == "__main__":
+
+    with ArduinoHID() as presser:
+        presser.win_r()
+        time.sleep(1)
+        presser.keyboard_print("notepad")
+        time.sleep(1)
+        presser.enter()
+        time.sleep(1)
+        #
+        presser.keyboard_execute_sequence(">>>", "<<<", [presser.KEY_LEFT_ARROW]*3, delay=0.25 )
+
+        with open("../asset/test_text_sample/123.txt", "r", encoding="utf-8") as f:
+            content = f.read()
+            for c in content:
+                presser.keyboard_type(c, delay=0.035)
+                presser.backspace()
+
+        presser.alt_f4()
+        presser.keyboard_execute_sequence(presser.KEY_LEFT_ARROW,
+                                          presser.KEY_RETURN, delay=0.5)
+
+
+        print("done")
