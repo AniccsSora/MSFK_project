@@ -119,7 +119,16 @@ WEB_THEME = Theme({
     "rule.text": Style(bold=True),
 })
 
-aaa="ausu"
+class ConsoleHighlighter(RegexHighlighter):
+    base_style = 'console.'
+    highlights = [
+        r'(?P<com>device:COM\d+)',
+    ]
+
+CONSOLE_THEME = Theme({
+    "console.com": Style(color="bright_cyan", bold=True),
+})
+
 # Logger init
 logger_debug = False
 logger = logging.getLogger("msfk")
@@ -134,7 +143,10 @@ web_formatter = logging.Formatter(
 
 
 # Add rich console logger
-stdout_console = console = Console()
+stdout_console = console = Console(highlighter=ConsoleHighlighter(), theme=CONSOLE_THEME)
+
+console.print("  test device:COM1,")
+
 console_hdlr = RichHandler(
     show_path=False,
     show_time=False,
@@ -197,6 +209,7 @@ def set_file_logger(name=pyw_name):
         tracebacks_show_locals=True,
         tracebacks_extra_lines=3,
         highlighter=NullHighlighter(),
+        # highlighter=Highlighter(),
     )
     hdlr.setFormatter(file_formatter)
 
@@ -208,7 +221,7 @@ def set_file_logger(name=pyw_name):
 
 def set_func_logger(func):
     console = HTMLConsole(
-        force_terminal=False,
+        force_terminal=False,  # write control codes
         force_interactive=False,
         width=80,
         color_system='truecolor',
@@ -361,7 +374,8 @@ LOG_DIR_SCREENSHOT.mkdir(exist_ok=True)
 logger.LOG_DIR_SCREENSHOT = LOG_DIR_SCREENSHOT
 #
 logger.LOG_DIR = LOG_DIR
-
+#
+logger.console_highlighter = ConsoleHighlighter()
 if __name__ == "__main__":
     # Run:
     #     python -m module.logger
